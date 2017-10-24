@@ -1,0 +1,153 @@
+#!/bin/bash
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+# Outil qui permet de faire un grep sur une adresse MAC dans un fichier. Le script prend
+# en charge les formats d'adresse MAC suivants :
+#  - xx:xx:xx:xx:xx:xx
+#  - xx-xx-xx-xx-xx-xx
+#  - xxxxxx-xxxxxx
+#  - xxxxxxxxxxxx
+# 
+# Le script est insensible à la case de l'adresse MAC
+#
+#
+# Auteur : Christophe Marteau
+# Date de dernière modification : 22/10/2015
+# Version : 1.0
+
+# Release notes :
+# 22/10/2015 : - Version initiale
+# 03/11/2015 : - Prise en compte des fichiers gzip
+# 05/11/2015 : - Prise en compte de plusieurs adresses mac séparés par des |
+#              - prise en compte de pattern qui ne sont pas des adresses MAC tel quel
+
+grepFilter="${1}"
+file="${2}"
+
+# Inclusion des fonctions communes
+source "$(dirname "$(readlink -f "$0")")/../lib/shellfunctions" || exit ${?}
+
+DEBUG=${DEBUG:0}
+
+DATE="$(${DATE_BINARY} "+%Y%m%d")"
+ZGREP_BINARY="/bin/zgrep"
+
+BINARY_LIST="${ZGREP_BINARY}"
+isLaunchable "${BINARY_LIST}"
+
+function usage() {
+  ${ECHO_BINARY} ""
+  ${ECHO_BINARY} "Outil qui permet essaye de reconnaitre une adresse MAC dans un filtre grep, pour l'étendre aux différents"
+  ${ECHO_BINARY} "formats d'adresse MAC pour effectuer une recherche dans un fichier. Le script prend en charge les formats"
+  ${ECHO_BINARY} "d'adresse MAC suivants :"
+  ${ECHO_BINARY} "  - xx:xx:xx:xx:xx:xx"
+  ${ECHO_BINARY} "  - xx-xx-xx-xx-xx-xx"
+  ${ECHO_BINARY} "  - xxxxxx-xxxxxx"
+  ${ECHO_BINARY} "  - xxxxxxxxxxxx"
+  ${ECHO_BINARY} "" 
+  ${ECHO_BINARY} "Le script est insensible à la case de l'adresse MAC"
+  ${ECHO_BINARY} ""
+  ${ECHO_BINARY} "Usage :"
+  ${ECHO_BINARY} "  $(${BASENAME_BINARY} ${0}) <filtre> <file>"
+  ${ECHO_BINARY} ""
+  ${ECHO_BINARY} "Exemple :"
+  ${ECHO_BINARY} "  $(${BASENAME_BINARY} ${0}) 84248D872DC4 /var/log/syslog"
+  ${ECHO_BINARY} ""
+  ${ECHO_BINARY} "L'équivalent grep de cet exemple est : '/bin/grep -iE \"84248d872dc4|84:24:8d:87:2d:c4|84-24-8d-87-2d-c4|84248d-872dc4\" \"/var/log/syslog\"'" 
+  ${ECHO_BINARY} ""
+  ${ECHO_BINARY} "  $(${BASENAME_BINARY} ${0}) 'blabla|84248D872DC4|plicploc|84:24:8d:87:2d:a4|213.234.45.46' /var/log/syslog"
+  ${ECHO_BINARY} ""
+  ${ECHO_BINARY} "L'équivalent grep de cet exemple est : '/bin/grep -iE \"blabla|84248d872dc4|84:24:8d:87:2d:c4|84-24-8d-87-2d-c4|84248d-872dc4|plicploc|84248d872da4|84:24:8d:87:2d:a4|84-24-8d-87-2d-a4|84248d-872da4|213.234.45.46\" \"/var/log/syslog\"'" 
+  ${ECHO_BINARY} ""
+}
+if [ -n "${grepFilter}" ]
+then
+  printMsg "main" "Found file : ${file}" "debug" 1
+  printMsg "main" "Found grep filter : ${grepFilter}" "debug" 1
+
+  grepFilterLower="${grepFilter,,}"
+  printMsg "main" "Lowered grep filter : ${grepFilterLower}" "debug" 2
+
+  expandedGrepFilter=""
+
+  while [ "${grepFilterLower}" ]
+  do
+    currentPattern="${grepFilterLower%%|*}"
+    printMsg "main" "Found pattern : ${currentPattern}" "debug" 1
+    if [[ "${currentPattern}" =~ '^(([a-f0-9]{2}[-:]){5}[a-f0-9]{2}|[a-f0-9]{6}-[a-f0-9]{6}|[a-f0-9]{12})$' ]]
+    then
+      macAdressReduce="${BASH_REMATCH[1]//[-:]/}"
+      printMsg "main" "Reduced MAC : ${macAdressReduce}" "debug" 1
+      if [[ "${macAdressReduce}" =~ "^([a-f0-9]{2})([a-f0-9]{2})([a-f0-9]{2})([a-f0-9]{2})([a-f0-9]{2})([a-f0-9]{2})$" ]]
+      then
+        macAddressManyColon="${BASH_REMATCH[1]}:${BASH_REMATCH[2]}:${BASH_REMATCH[3]}:${BASH_REMATCH[4]}:${BASH_REMATCH[5]}:${BASH_REMATCH[6]}"
+        macAddressManyDash="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]}-${BASH_REMATCH[4]}-${BASH_REMATCH[5]}-${BASH_REMATCH[6]}"
+        macAddressOneDash="${BASH_REMATCH[1]}${BASH_REMATCH[2]}${BASH_REMATCH[3]}-${BASH_REMATCH[4]}${BASH_REMATCH[5]}${BASH_REMATCH[6]}"
+        printMsg "main" "Generated MAC with many colon : ${macAddressManyColon}" "debug" 1
+        printMsg "main" "Generated MAC with many dash : ${macAddressManyDash}" "debug" 1
+        printMsg "main" "Generated MAC with one dash : ${macAddressOneDash}" "debug" 1
+        if [ -n "${expandedGrepFilter}" ]
+        then
+          expandedGrepFilter="${expandedGrepFilter}|${macAdressReduce}|${macAddressManyColon}|${macAddressManyDash}|${macAddressOneDash}"
+        else
+          expandedGrepFilter="${macAdressReduce}|${macAddressManyColon}|${macAddressManyDash}|${macAddressOneDash}"
+        fi
+      else
+        printMsg "main" "Unexpected error when parsing reduce mac address '${macAdressReduce}'." "error"
+        exit 1
+      fi
+    else
+      printMsg "main" "No MAC address found : ${currentPattern}" "debug" 1
+      if [ -n "${expandedGrepFilter}" ]
+      then
+        expandedGrepFilter="${expandedGrepFilter}|${currentPattern}"
+      else
+        expandedGrepFilter="${currentPattern}"
+      fi
+    fi
+    
+    # We shilt current element from list
+    if [ "${grepFilterLower}" == "${currentPattern}" ]
+    then
+      grepFilterLower=''
+    else  
+      grepFilterLower="${grepFilterLower#*|}"
+    fi
+  done
+     
+  if [ -z "${file}" ]
+  then 
+    printMsg "main" "Generated grep command : ${GREP_BINARY} -iE \"${expandedGrepFilter}\"" "debug" 1
+    ${GREP_BINARY} -iE "${expandedGrepFilter}"
+  else
+    if [ -f "${file}" ]
+    then
+      if [[ "${file}" =~ '\.gz$' ]]
+      then
+        printMsg "main" "Generated zgrep command : ${ZGREP_BINARY} -iE \"${expandedGrepFilter}\" \"${file}\"" "debug" 1
+        ${ZGREP_BINARY} -iE "${expandedGrepFilter}" "${file}"
+      else
+        printMsg "main" "Generated grep command : ${GREP_BINARY} -iE \"${expandedGrepFilter}\" \"${file}\"" "debug" 1
+        ${GREP_BINARY} -iE "${expandedGrepFilter}" "${file}"
+      fi
+    else
+      printMsg "main" "Unable to open file '${file}'." "error"
+      usage
+    fi
+  fi
+
+else
+  usage
+fi

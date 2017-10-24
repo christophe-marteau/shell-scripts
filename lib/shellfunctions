@@ -1,0 +1,613 @@
+#!/bin/bash
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+# Collection de fonctions shells
+#
+# Auteur : Christophe Marteau
+# Date de dernière modification : 19/07/2011
+# Version : 1.0
+#
+# Realease notes :
+# 23/11/2009 : - Version initiale
+# 26/11/2009 : - Modification de la fonction debug pour la rendre plus compatible avec syslog
+# 30/11/2009 : - Ajout de la fonction sendMail
+# 01/12/2009 : - Remplacement de la fonction debug par printMsg plus generale
+# 11/12/2009 : - Correction d'un bug dans printMsg pour l'affichage des messages contenant des retours chariot
+#              - Modification de la fonction sendMail pour utiliser la commande netcat plutot que sendmail
+# 16/12/2009 : - Suppression de l'option -q de netcat cat incompatible avec la version installée sur les centos
+# 22/12/2009 : - Reindentation du code et corrections de quelques erreurs de syntaxes
+#              - Ajout de la fonction evalCommand et réécriture des fonctions
+# 04/01/2010 : - Ajout de l'indentation dans la fonction d'affichage des messages
+# 12/01/2010 : - Correction d'un bug mineur dans la fonction "deleteOldFiles"
+# 10/02/2010 : - Support des espaces dans les noms de fichiers pour "deleteOldFiles"
+# 23/04/2010 : - Correction d'un bug dans la fonction sendMail utilisation de >> plutot que logMsg pour 
+#                les gros volume de données à écrire
+# 29/06/2011 : - Ajout de l'affichage de la commande lancee en mode simulation dans la fonction evalCommmand
+#              - Ajout de la fonction spaceLeftOnDevice qui permet de tester s'il reste assez de place sur un
+#                peripherique 
+# 18/07/2011 : - Correction de la definition de la variable SPACE qui doit être en kilo octet et non pas en octet 
+#                dans la fonction spaceLeftOnDevice
+# 19/07/2011 : - Ajout d'un controle sur l'existence du fichier de configuration dans la fonction loadConfFile
+# 25/08/2011 : - Ajout de la fonction isSudoLaunchable
+
+# Fonction qui loggue un message dans un fichier ou dans syslog
+# [in] $LOG_MSG : Le message à logger
+# [in] $LOG_FILE : Le fichier dans lequel on souhaite envoyer le message ou syslog
+# [in] $LOG_FACILITY : Le facility pour définir la destination du log (uniquement pour syslog).
+#                      Par defaut "local0".
+#                      facility : local0 à local7
+# [in] $LOG_LEVEL : Le level pour définir la priorite du log (uniquement pour syslog).
+#                   Par defaut "info".
+#                   level : alert, crit, debug, emerg, err, error, info, notice, warning, warn
+function logMsg() {
+    local LOG_MSG="${1}"
+    local LOG_FILE="${2}"
+    local LOG_FACILITY="${3:-local0}"
+    local LOG_LEVEL="${4:-info}"
+
+    local R_MSG=""
+    local R_CODE=0
+    
+    local PRINT_INDENT_PRIORITY=""
+    if [ -n "${PRINT_INDENT_STRING}" ] ; then
+        PRINT_INDENT_PRIORITY="-9"
+    fi
+    
+    if [ "${LOG_FILE}" = "syslog" ] ; then
+        if [[ "${LOG_FACILITY}.${LOG_LEVEL}" =~ '^(local0|local1|local2|local3|local4|local5|local6|local7)\.(alert|crit|debug|emerg|err|error|info|notice|warning|warn)$' ]] ; then
+            ${LOGGER_BINARY} -p "${LOG_FACILITY}.${LOG_LEVEL}" -t "$(${BASENAME_BINARY} ${0})" "${LOG_MSG}"
+        else
+            ${PRINTF_BINARY} "%${PRINT_INDENT_PRIORITY}s ${PRINT_INDENT:2}%s %s" "[err]" "(logMsg)" "No log facility for '${LOG_FACILITY}.${LOG_LEVEL}'"
+        fi
+    else
+        if [ -d "$(${DIRNAME_BINARY} "${LOG_FILE}")" ] ; then
+            R_MSG="$(${TOUCH_BINARY} ${LOG_FILE} 2>&1)"
+            R_CODE=${?}
+            if [ ${R_CODE} -eq 0 ] ; then
+                ${ECHO_BINARY} "${LOG_MSG}" >> "${LOG_FILE}"
+            else
+                ${PRINTF_BINARY} "%${PRINT_INDENT_PRIORITY}s ${PRINT_INDENT:2}%s %s" "[notice]" "(logMsg)" "[${R_CODE}] ${R_MSG}'"
+                ${PRINTF_BINARY} "%${PRINT_INDENT_PRIORITY}s ${PRINT_INDENT:2}%s %s" "[err]" "(logMsg)" "Unable to log in file '${LOG_FILE}'"
+            fi
+        else
+            R_MSG="$(${MKDIR_BINARY} -p "$(${DIRNAME_BINARY} "${LOG_FILE}")")"
+            R_CODE=${?}
+	    if [ ${R_CODE} -eq 0 ] ; then
+                R_MSG="$(${TOUCH_BINARY} ${LOG_FILE} 2>&1)"
+                R_CODE=${?}
+                if [ ${R_CODE} -eq 0 ] ; then
+                    ${ECHO_BINARY} "${LOG_MSG}" >> "${LOG_FILE}"
+                else
+                    ${PRINTF_BINARY} "%${PRINT_INDENT_PRIORITY}s ${PRINT_INDENT:2}%s %s" "[notice]" "(logMsg) [${R_CODE}] ${R_MSG}'"
+                    ${PRINTF_BINARY} "%${PRINT_INDENT_PRIORITY}s ${PRINT_INDENT:2}%s %s" "[err]" "(logMsg) Unable to log in file '${LOG_FILE}'"
+                fi
+            else
+                ${PRINTF_BINARY} "%${PRINT_INDENT_PRIORITY}s ${PRINT_INDENT:2}%s %s" "[notice]" "(logMsg)" "[${R_CODE}] ${R_MSG}'"
+                ${PRINTF_BINARY} "%${PRINT_INDENT_PRIORITY}s ${PRINT_INDENT:2}%s %s" "[err]" "(logMsg)" "Unable to create log directory '$(${DIRNAME_BINARY} "${LOG_FILE}")'"
+            fi
+        fi
+    fi
+}
+
+# Fonction qui affiche un message.
+# Si la variable "LOG_FILE" est definie, alors les messages sont rediriges vers ce fichier (ou "syslog")
+# [in] $PRINT_FUNCTION_NAME : Nom de fonction dans laquelle on se trouve
+# [in] $PRINT_MESSAGE : Message a afficher ("No msg" par defaut)
+# [in] $PRINT_PRIORITY : la priorite du message ('info' par defaut)
+#                        Valeurs possibles: alert, crit, debug, emerg, err, error, info, notice, warning, warn
+# [in] $PRINT_DEBUG_LEVEL : niveau du debuggage
+function printMsg() {
+    local PRINT_FUNCTION_NAME="${1}"
+    local PRINT_MESSAGE="${2:-No msg}"
+    local PRINT_PRIORITY="${3:-info}"
+    local PRINT_DEBUG_LEVEL="${4:-1}"
+
+    local PRINT_LINE_CPT=0
+
+    local PRINT_INDENT_PRIORITY=""
+    if [ -n "${PRINT_INDENT_STRING}" ] ; then
+        PRINT_INDENT_PRIORITY="-9"
+    fi
+
+    if [[ ${PRINT_PRIORITY} =~ '^(alert|crit|debug|emerg|err|error|info|notice|warning|warn)$' ]] ; then
+        IFS="
+"   
+        # Calcul de l'indentation
+        if [[ "${PRINT_MESSAGE}" =~ "^(DEBUT|BEGIN) " ]] ; then
+            PRINT_INDENT="${PRINT_INDENT_STRING}${PRINT_INDENT}"
+        fi
+
+        for print_message_line in ${PRINT_MESSAGE}
+        do
+            if [ ${PRINT_LINE_CPT} -eq 0 ] ; then
+                print_message_line="$(${PRINTF_BINARY} "%${PRINT_INDENT_PRIORITY}s ${PRINT_INDENT:2}%s %s" "[${PRINT_PRIORITY}]" "(${PRINT_FUNCTION_NAME})" "${print_message_line}")"
+            else
+                print_message_line="$(${PRINTF_BINARY} "%${PRINT_INDENT_PRIORITY}s ${PRINT_INDENT:2}%s %s" "[${PRINT_PRIORITY}]" "(${PRINT_FUNCTION_NAME}) ..." "${print_message_line}")"
+            fi
+            if [ "${PRINT_PRIORITY}" != "debug" ] || [ ${DEBUG} -ge ${PRINT_DEBUG_LEVEL} ] ; then 
+	        case "${LOG_FILE}" in
+                    "syslog")
+                        logMsg "${print_message_line}" "${LOG_FILE}" "${LOG_FACILITY}" "${PRINT_PRIORITY}"
+                        ;;
+                    "")
+                        ${ECHO_BINARY} "${print_message_line}" >&2
+                        ;;
+                    *)
+                        logMsg "$(${DATE_BINARY} "+%b %-d %T") $(${HOSTNAME_BINARY} -s)  $(${BASENAME_BINARY} "${0}"): ${print_message_line}" "${LOG_FILE}"
+                        ;;
+                 esac
+            fi
+            ((PRINT_LINE_CPT ++))
+        done
+        IFS="${IFS_INI}"
+
+        # Calcul de l'indentation
+        if [[ "${PRINT_MESSAGE}" =~ "^(FIN|END) " ]] ; then
+            PRINT_INDENT="${PRINT_INDENT:2}"
+        fi
+   else
+        ${PRINTF_BINARY} "%${PRINT_INDENT_PRIORITY}s ${PRINT_INDENT:2}%s %s" "[err]" "(printMsg)" "Invalid message priority '${PRINT_PRIORITY}'."
+   fi
+}
+
+# Fonction qui affiche un message de debuggage pour le menu de traitement des options 
+# en fonction de la variable DEBUG_MENU
+# [in] $DEBUG_MENU_TYPE : 0 pour le debut de la chaine (pas de retour chariot) 
+#                         et 1 pour la fin de la chaine
+# [in] $DEBUG_MENU_MSG : Message de debuggage a afficher
+function debugMenu() {
+    local DEBUG_MENU_TYPE="${1}"
+    local DEBUG_MENU_MSG="${2}"
+
+    if [ ${DEBUG_MENU} -eq 1 ] ; then
+        if [ ${DEBUG_MENU_TYPE} -eq 0 ] ; then
+            ${ECHO_BINARY} -n "#DEBUG MENU : ${DEBUG_MENU_MSG} = " >&2
+        else
+            ${ECHO_BINARY} "[${DEBUG_MENU_MSG}]" >&2
+        fi
+    fi
+}
+
+# Fonction qui execute une commande
+# Si la commande echoue, le message est affiché en erreur, sinon, il est affiché en debug
+# [in] $EVAL_COMMAND : La commande que l'on souhaite executer
+# [in] $EVAL_EXEC_MODE : 0 mode simulation (par defaut), 1 mode execution
+function evalCommand() {
+    printMsg "evalCommand" "DEBUT evalCommand" "debug" "9"
+    local EVAL_COMMAND="${1} 2>&1"
+    local EVAL_EXEC_MODE="${2:-0}"
+
+    local EVAL_MSG=""
+    local EVAL_CODE=0
+   
+    if [ ${EVAL_EXEC_MODE} -ne 0 ] ; then
+        EVAL_MSG="$(eval "${EVAL_COMMAND}")"
+        EVAL_CODE="${?}"
+        if [ ${EVAL_CODE} -eq 0 ] ; then
+            printMsg "evalCommand" "=> ${EVAL_COMMAND}" "debug" "3"  
+            printMsg "evalCommand" "<= [${EVAL_CODE}] ${EVAL_MSG}" "debug" "3"
+        else
+            printMsg "evalCommand" "=> ${EVAL_COMMAND}" "err"  
+            printMsg "evalCommand" "<= [${EVAL_CODE}] ${EVAL_MSG}" "err"
+        fi
+    else
+        printMsg "evalCommand" "=> ${EVAL_COMMAND}" "debug" "3"
+    fi
+    printMsg "evalCommand" "FIN evalCommand" "debug" "9"
+    return ${EVAL_CODE}
+}
+
+# Fonction qui retourne le nombre d'occurence d'un element dans un tableau. 
+# Le passage d'un tableau en parametre d'une fonction necessite une 
+# manipulation. Par exemple pour savoir si un element 'elt="toto"' est 
+# présent dans un tableau 'tab=( elt1 elt2 elt3 )' on invoquera la 
+# fonction comme ceci : 
+#   nb_occurence=$(inArray "${elt}" "$(echo ${tab[@]})")
+#
+# [in] $ELEMENT : l'élement à vérifier
+# [in] $ARRAY : Le tableau contenant les éléments
+# [return] : Le nombre d'occurence de l'élément dans le tableau
+function inArray() {
+    printMsg "inArray" "DEBUT inArray" "debug" "9"
+    local ELEMENT="${1}"
+    local ARRAY=( $(echo ${2}) )
+
+    local OCCURENCE=0
+    for((elt=0; elt < ${#ARRAY[@]}; elt++))
+    do
+        if [ "${ELEMENT}" == "${ARRAY[${elt}]}" ] ; then
+            (( OCCURENCE++ ))
+        fi
+    done
+    printMsg "inArray" "inArray(${ELEMENT},[$(echo "${ARRAY[@]}"]))=${OCCURENCE}" "debug" "5"
+    ${ECHO_BINARY} "${OCCURENCE}"
+    printMsg "inArray" "FIN inArray" "debug" "9"
+}
+
+# Fonction qui teste s'il reste au moins SPACE (en kilo octet) sur le perpherique DEVICE (peut etre un repertoire)
+# [in] $DEVICE : Le peripherique ou repertoire a verifier
+# [in] $SPACE : L'espace minimum qui doit être disponible sur le peripherique en kilo octet
+# [return] : 0 si il reste assez d'espace et un code d'erreur superieur a 0 sinon
+function spaceLeftOnDevice() {
+    printMsg "spaceLeftOnDevice" "DEBUT spaceLeftOnDevice" "debug" "9"
+    local DEVICE="${1}"
+    local SPACE="${2}"
+
+    local R_MSG="$(${DF_BINARY} --sync -P ${DEVICE} 2>&1 | ${GREP_BINARY} -vE '^Filesystem' )"
+    local R_CODE="${?}"
+    if [ ${R_CODE} -eq 0 ] ; then
+        if [[ ${R_MSG} =~ '^([^\t ]+)[\t ]+([^\t ]+)[\t ]+([^\t ]+)[\t ]+([^\t ]+)[\t ]+([^\t ]+)[\t ]+([^\t ]+)' ]] ; then
+            local FILESYSTEM="${BASH_REMATCH[1]}"
+            local BLOCKS="${BASH_REMATCH[2]}"
+            local USED="${BASH_REMATCH[3]}"
+            local AVAILABLE="${BASH_REMATCH[4]}"
+            local CAPACITY="${BASH_REMATCH[5]}"
+            local MOUNTED_ON="${BASH_REMATCH[6]}"
+            printMsg "spaceLeftOnDevice" "Filesystem=[${FILESYSTEM}], Blocks=[${BLOCKS}], Used=[${USED}], Available=[${AVAILABLE}], Capacity=[${CAPACITY}], Mounted on=[${MOUNTED_ON}]." "debug" "8"
+            if [ ${AVAILABLE} -gt ${SPACE} ] ; then
+                printMsg "spaceLeftOnDevice" "Enough space (${AVAILABLE} > ${SPACE}) on device '${DEVICE}' : [OK]" "info"
+                R_CODE=0
+            else
+                printMsg "spaceLeftOnDevice" "Not enough space (${AVAILABLE} < ${SPACE}) on device '${DEVICE}' : [FAILED]" "err"
+                R_CODE=1
+            fi
+        else
+            printMsg "spaceLeftOnDevice" "Unable to parse space information for device '${DEVICE}' : [FAILED]" "err"
+        fi
+    else
+        printMsg "spaceLeftOnDevice" "Unable to retrieve space information for device '${DEVICE}' : [FAILED]" "err"
+    fi
+    printMsg "spaceLeftOnDevice" "FIN spaceLeftOnDevice" "debug" "9"
+    return ${R_CODE} 
+}
+
+# Fonction qui genere le caractere espace dans une chaine contenant #espace#
+# [in] $STRING_TO_REPLACE : La chaine à transformer
+function spaceReplace() {
+    printMsg "spaceReplace" "BEGIN spaceReplace" "debug" "9"
+    local STRING_TO_REPLACE="$1"
+
+    local STRING_REPLACE=${STRING_TO_REPLACE//#espace#/ }
+    printMsg "spaceReplace" "Replace '${STRING_TO_REPLACE}' by '${STRING_REPLACE}'" "debug" "5"
+    ${ECHO_BINARY} ${STRING_REPLACE}
+    printMsg "spaceReplace" "END spaceReplace" "debug" "9"
+}
+
+# Fonction qui vérifie que toutes les commandes utilisées sont disponibles
+# [in] $BINARY_LIST : La liste des commandes à verifier
+function isLaunchable() {
+    printMsg "isLaunchable" "BEGIN isLaunchable" "debug" "9"
+    local BINARY_LIST="${1}"
+
+    local IS_LAUNCHABLE_ERROR=0
+    for binary in ${BINARY_LIST}
+    do
+        if [ -f ${binary} ] ; then
+            printMsg "isLaunchable" "'${binary}' : [FOUND]" "debug" "8"
+        else
+            printMsg "isLaunchable" "'${binary}' : [NOT FOUND]" "err"
+            IS_LAUNCHABLE_ERROR=1
+        fi
+    done
+       if [ ${IS_LAUNCHABLE_ERROR} -eq 1 ] ; then
+        printMsg "isLaunchable" "Impossible d'executer le script." "err"
+        printMsg "isLaunchable" "END isLaunchable" "debug" "9"
+        exit 1
+    fi
+    printMsg "isLaunchable" "END isLaunchable"  "debug" "9"
+}
+
+# Fonction qui vérifie que toutes les commandes utilisées sont executables via sudo
+# [in] $BINARY_LIST : La liste des commandes à verifier
+function isSudoLaunchable() {
+    printMsg "isSudoLaunchable" "BEGIN isSudoLaunchable" "debug" "9"
+    local BINARY_LIST="${1}"
+
+    local SUDO_BINARY_LIST=""
+    local IS_SUDO_LAUNCHABLE_ERROR=0
+    for sudoBinary in ${BINARY_LIST}
+    do
+        if [ -f ${sudoBinary} ] ; then
+            printMsg "isSudoLaunchable" "'${sudoBinary}' : [FOUND]" "debug" "8"
+            SUDO_BINARY_LIST="${SUDO_BINARY_LIST} ${sudoBinary}"
+        else
+            printMsg "isSudoLaunchable" "'${sudoBinary}' : [NOT FOUND]" "err"
+            IS_SUDO_LAUNCHABLE_ERROR=1
+        fi
+    done
+
+    for sudoBinary in ${SUDO_BINARY_LIST}
+    do
+        if [[ "$(${ECHO_BINARY} "[mot#de#p@sse#nul#impossible#normalement]" | ${SUDO_BINARY} -l -S 2>/dev/null | ${GREP_BINARY} -E "${sudoBinary}($|,)" )" || "$(${ECHO_BINARY} "[mot#de#p@sse#nul#impossible#normalement]" | ${SUDO_BINARY} -l -S 2>/dev/null | ${GREP_BINARY} -E "ALL$" )" ]] ; then
+            printMsg "isSudoLaunchable" "'${sudoBinary}' => [SUDO EXECUTABLE]" "debug" "7"
+        else
+            printMsg "isSudoLaunchable" "'${sudoBinary}' is not executable with sudo => [NOT SUDO EXECUTABLE]" "err"
+            IS_SUDO_LAUNCHABLE_ERROR=1
+        fi
+    done
+
+        if [ ${IS_SUDO_LAUNCHABLE_ERROR} -eq 1 ] ; then
+        printMsg "isSudoLaunchable" "Impossible d'executer le script." "err"
+        printMsg "isSudoLaunchable" "END isSudoLaunchable" "debug" "9"
+        exit 1
+    fi
+    printMsg "isSudoLaunchable" "END isSudoLaunchable"  "debug" "9"
+}
+
+# Fonction qui charge le fichier de configuration
+# [in] $CONF_FILE : Le fichier de configuration a charger
+function loadConfFile() {
+    printMsg "loadConfFile" "BEGIN loadConfFile" "debug" "9"
+    local CONF_FILE="${1}"
+    
+    local R_MSG=""
+    local R_CODE=0  
+  
+    if [ -f "${CONF_FILE}" ] ; then
+        R_MSG="$(source "${CONF_FILE}" 2>&1)"
+        R_CODE=${?}
+        if [ ${R_CODE} -ne 0 ] ; then
+            printMsg "loadConfFile" "Unable to load configuration file '${CONF_FILE}'" "err"
+            printMsg "loadConfFile" "${R_MSG}" "debug" "7"
+            printMsg "loadConfFile" "END loadConfFile" "debug" "9"
+            exit ${R_CODE}
+        else
+            source "${CONF_FILE}"
+            printMsg "loadConfFile" "Loading configuration file '${CONF_FILE}' : [OK]" "debug" "5"
+        fi
+    else
+        printMsg "loadConfFile" "Unable to find configuration file '${CONF_FILE}'" "err"
+        printMsg "loadConfFile" "END loadConfFile" "debug" "9"
+        exit 1
+    fi 
+    printMsg "loadConfFile" "END loadConfFile" "debug" "9"
+}
+
+# Fonction qui supprime les fichiers d'un répertoire et ne conserve que les FILE_NB derniers
+# Le nom des fichiers doit comporter la date (YYYY-MM-DD) de creation du fichier qui doit 
+# etre remplacee par caractere * dans le pattern.
+# Attention : Si le nom du fichier ne contient pas de date, si elle n'est pas dans le format 
+#             YYYY-MM-DD ou si elle n'est pas remplacee par '*' dans FILE_PATTERN alors les 
+#             fichiers supprimes seront les FILE_NB derniers fichiers donnes par la commande 
+#             'ls -1 FILE_PATTERN'.
+# Note : Pour les fichiers contenant des espaces, ils sont remplacés par le caractere "?"
+# Exemple :
+#   Fichier : fichier_2009-10-01.tar.bz2
+#   Pattern : fichier_*.tar.bz2
+# [in] $FILE_PATH : Le chemin dans lequel se trouve les fichiers a supprimer
+# [in] $FILE_PATTERN : Le pattern decrivant des fichiers a supprimer
+# [in] $FILE_NB : Le nombre de fichier a conserver
+# [in] $FILE_EXEC_MODE : 0 mode simulation (par defaut), 1 mode execution
+function deleteOldFiles() {
+    printMsg "deleteOldFiles" "BEGIN deleteOldFiles" "debug" "9"
+    local FILE_PATH="${1}"
+    local FILE_PATTERN="${2}"
+    local FILE_NB=${3}
+    local FILE_EXEC_MODE=${4:-0}
+
+    local R_CODE=0
+    local R_MSG=""
+    local FILE_FOUND=""
+    
+    printMsg "deleteOldFiles" "Searching files with pattern '${FILE_PATTERN// /?}' in folder '${FILE_PATH}'"
+    FILE_FOUND="$(${LS_BINARY} -1 ${FILE_PATH}/${FILE_PATTERN// /?} 2>&1)"
+    if [ ${?} -ne 0 ] ; then
+        printMsg "deleteOldFiles" "No file found for deletion" "notice"
+    else
+        local FILE_FOUND_NB="$(${ECHO_BINARY} "${FILE_FOUND}" | ${SORT_BINARY} -r | ${WC_BINARY} -l 2>&1)"
+        printMsg "deleteOldFiles" "Found '${FILE_FOUND_NB}' files"
+        printMsg "deleteOldFiles" "Files found : $(${ECHO_BINARY} "${FILE_FOUND}" | ${SORT_BINARY} -r)" "debug" "8"
+        local FILE_DELETE_NB=$(${ECHO_BINARY} "if (${FILE_FOUND_NB} - ${FILE_NB} > 0 ) ${FILE_FOUND_NB} - ${FILE_NB} else 0" | ${BC_BINARY} 2<&1)
+        if [[ "${FILE_DELETE_NB}" =~ "^[0-9]+$" ]] ; then
+            printMsg "deleteOldFiles" "Attempting to delete ${FILE_DELETE_NB} file(s) (Keeping '${FILE_NB}' file(s))"
+            if [ ${R_CODE} -eq 0 ] ; then
+                local FILE_DELETE="$(${ECHO_BINARY} "${FILE_FOUND}" | ${SORT_BINARY} -r | ${TAIL_BINARY} -n ${FILE_DELETE_NB})"
+                IFS="
+"
+                for deleteFile in ${FILE_DELETE}
+                do
+                    printMsg "deleteOldFiles" "Deleting file '${deleteFile}'"
+                    evalCommand "${RM_BINARY} -f \"${deleteFile}\"" "${FILE_EXEC_MODE}"
+                done
+                IFS="${IFS_INI}"
+            fi
+        else
+            printMsg "deleteOldFiles" "No file found for deletion" "notice"
+        fi
+    fi
+    printMsg "deleteOldFiles" "END deleteOldFiles" "debug" "9"
+}
+
+# Fonction qui permet d'envoyer un message avec des fichiers attachées
+# [in] $MAIL_HOST_NAME : Le nom du serveur smtp sur lequel envoyer le message
+# [in] $MAIL_HOST_PORT : Le port du serveur smtp sur lequel envoyer le message
+# [in] $MAIL_FROM : L'adresse mail de l'expéditeur du message
+# [in] $MAIL_RCPT_LIST : La liste des adresses mail des destinataires séparés par des espaces
+# [in] $MAIL_SUBJECT_TAG : Le tag du sujet -> Subject: [TAG] Sujet du message (optionel)
+# [in] $MAIL_SUBJECT : Le sujet du message
+# [in] $MAIL_BODY_FILE : Le fichier contenant le corps du message
+# [in] $MAIL_FILE_LIST : La liste des fichiers à attacher séparés par des espaces (optionel)
+# [in] $EXEC_MODE : 0 mode simulation (par defaut), 1 mode execution
+function sendMail() {
+    printMsg "sendMail" "BEGIN sendMail" "debug" "9"
+    local MAIL_HOST_NAME="${1}"
+    local MAIL_HOST_PORT="${2}"
+    local MAIL_FROM="${3}"    
+    local MAIL_RCPT_LIST="${4}"
+    local MAIL_SUBJECT_TAG="${5}"
+    local MAIL_SUBJECT="${6}"
+    local MAIL_BODY_FILE="${7}"
+    local MAIL_FILE_LIST="${8}"
+    local MAIL_EXEC_MODE=${9:-0}
+
+    local R_CODE=0
+    local R_MSG=""
+
+    printMsg "sendMail" "Testing mail gataway availability ..."
+    evalCommand "${ECHO_BINARY} \"EHLO $(${HOSTNAME_BINARY})\" | ${NC_BINARY} -w ${NETCAT_TIMEOUT} \"${MAIL_HOST_NAME}\" \"${MAIL_HOST_PORT}\"" "${MAIL_EXEC_MODE}"
+    if [ ${?} -eq 0 ] ; then
+        printMsg "sendMail" "Creating mail ..."
+        evalCommand "${MKDIR_BINARY} -p \"${MAIL_TMP_FOLDER}\"" "${MAIL_EXEC_MODE}"
+        if [ ${?} -eq 0 ] ; then
+            local MAIL_FILE_TMP="$(${MKTEMP_BINARY} -p "${MAIL_TMP_FOLDER}" mail-XXXXXXXXXX)"
+            if [ -f "${MAIL_FILE_TMP}" ] ; then
+                if [ -n "${MAIL_FROM}" ] ; then
+                    printMsg "sendMail" "Adding Header : [From: ${MAIL_FROM}]" "debug" "6"
+                    logMsg "From: ${MAIL_FROM}" "${MAIL_FILE_TMP}"
+                    if [ -n "${MAIL_RCPT_LIST}" ] ; then
+                        for rcpt_to in ${MAIL_RCPT_LIST}
+                        do
+                            printMsg "sendMail" "Adding Header : [To: ${rcpt_to}]" "debug" "6"
+                            logMsg "To: ${rcpt_to}" "${MAIL_FILE_TMP}"
+                        done
+                        if [ -n "${MAIL_SUBJECT_TAG}" ] ; then 
+                            MAIL_SUBJECT="[${MAIL_SUBJECT_TAG}] ${MAIL_SUBJECT}"
+                        fi
+                        printMsg "sendMail" "Adding Header : [Subject: ${MAIL_SUBJECT}]" "debug" "6"
+                        logMsg "Subject: ${MAIL_SUBJECT}" "${MAIL_FILE_TMP}"
+                        
+                        printMsg "sendMail" "Adding Header : [Content-Type: multipart/mixed]" "debug" "6"
+                        logMsg "Content-Type: multipart/mixed;" "${MAIL_FILE_TMP}"
+                        logMsg " boundary=\"------------070406060804050703030208\"" "${MAIL_FILE_TMP}"
+                        printMsg "sendMail" "Ending Headers." "debug" "6"
+                        logMsg ""  "${MAIL_FILE_TMP}"
+            
+                        local NB_ATTACHED_FILE=0
+                        for attach_file in ${MAIL_BODY_FILE} ${MAIL_FILE_LIST}
+                        do
+                            if [ -f "${attach_file}" ] ; then
+                                printMsg "sendMail" "Adding File '${attach_file}'" "debug" "6"
+                                if [ ${NB_ATTACHED_FILE} -eq 0 ] ; then
+                                    logMsg "This is a multi-part message in MIME format." "${MAIL_FILE_TMP}"
+                                fi
+                                logMsg "--------------070406060804050703030208" "${MAIL_FILE_TMP}"
+                                ((NB_ATTACHED_FILE++))
+                                ATTACH_MIME_TYPE="$(${FILE_BINARY} -bi ${attach_file})"
+                                logMsg "Content-Type: ${ATTACH_MIME_TYPE}" "${MAIL_FILE_TMP}"
+                                logMsg "Content-Transfer-Encoding: base64" "${MAIL_FILE_TMP}"
+                                logMsg "Content-Disposition: inline;"  "${MAIL_FILE_TMP}"
+                                logMsg " filename=\"$(${BASENAME_BINARY} "${attach_file}")\"" "${MAIL_FILE_TMP}"
+                        	    logMsg "" "${MAIL_FILE_TMP}"
+                                printMsg "sendMail" "Encoding '${attach_file}' in base64." "debug" "6"
+                                ${UUENCODE_BINARY} --base64 "${attach_file}" "$(${BASENAME_BINARY} "${attach_file}")" | ${GREP_BINARY} -vE '====|begin' >> "${MAIL_FILE_TMP}"
+                            else
+                                printMsg "sendMail" "No file '${attach_file}' found." "notice"
+                            fi
+                        done
+                        if [ ${NB_ATTACHED_FILE} -gt 0 ] ; then
+                            logMsg "--------------070406060804050703030208--" "${MAIL_FILE_TMP}"
+                        fi
+                            
+                        for rcpt_to in ${MAIL_RCPT_LIST}
+                        do
+    			local MAIL_COMMAND_TMP="$(${MKTEMP_BINARY} -p "${MAIL_TMP_FOLDER}" mail-command-XXXXXXXXXX)"
+                            if [ -f "${MAIL_COMMAND_TMP}" ] ; then
+                                printMsg "sendMail" "Creating mail commands"
+	                        logMsg "EHLO $(${HOSTNAME_BINARY})" "${MAIL_COMMAND_TMP}"
+    	                        logMsg "MAIL FROM: ${MAIL_FROM}" "${MAIL_COMMAND_TMP}"
+                                logMsg "RCPT TO: ${rcpt_to}" "${MAIL_COMMAND_TMP}"
+                                logMsg "DATA" "${MAIL_COMMAND_TMP}"
+                                ${CAT_BINARY} "${MAIL_FILE_TMP}" >> "${MAIL_COMMAND_TMP}"
+                                logMsg "." "${MAIL_COMMAND_TMP}"
+    
+                                printMsg "sendMail" "Sending mail to '${rcpt_to}' on '${MAIL_HOST_NAME}:${MAIL_HOST_PORT}'"
+                                evalCommand "${CAT_BINARY} \"${MAIL_COMMAND_TMP}\" | ${NC_BINARY} -w ${NETCAT_TIMEOUT} \"${MAIL_HOST_NAME}\" \"${MAIL_HOST_PORT}\"" "${MAIL_EXEC_MODE}"
+                                printMsg "sendMail" "Deleteting mail command file '${MAIL_COMMAND_TMP}'" "debug" "5"
+                                ${RM_BINARY} -f "${MAIL_COMMAND_TMP}"
+                            else
+                                printMsg "sendMail" "Unable to create mail command file '${MAIL_COMMAND_TMP}'." "err"
+                            fi
+                        done
+                    else
+                        printMsg "sendMail" "No recipient list found '${MAIL_RCPT_LIST}'." "err"
+                    fi
+                else
+                    printMsg "sendMail" "No sender found '${MAIL_FROM}'." "err"
+                fi
+                printMsg "sendMail" "Deleteting mail tmp file '${MAIL_FILE_TMP}'" "debug" "5"
+                ${RM_BINARY} -f "${MAIL_FILE_TMP}"
+            else
+                printMsg "sendMail" "Unable to create mail tmp file '${MAIL_FILE_TMP}'." "err"
+            fi
+        else
+            printMsg "sendMail" "Unable to create mail tmp directory '${MAIL_TMP_FOLDER}'." "err"
+        fi
+    else
+        printMsg "sendMail" "Unable to access to mail gataway '${MAIL_HOST_NAME}' on port '${MAIL_HOST_PORT}'." "err"
+    fi
+    printMsg "sendMail" "END sendMail" "debug" "9"
+}
+
+# Initialisation des variables
+# Definition des binaires
+BC_BINARY="/usr/bin/bc"
+CAT_BINARY="/bin/cat"
+DATE_BINARY="/bin/date"
+DIRNAME_BINARY="/usr/bin/dirname"
+DF_BINARY="/bin/df"
+ECHO_BINARY="/bin/echo"
+FILE_BINARY="/usr/bin/file"
+GREP_BINARY="/bin/grep"
+HOSTNAME_BINARY="/bin/hostname"
+LOGGER_BINARY="/usr/bin/logger"
+LS_BINARY="/bin/ls"
+MKDIR_BINARY="/bin/mkdir"
+MKTEMP_BINARY="/bin/mktemp"
+PRINTF_BINARY="/usr/bin/printf"
+RM_BINARY="/bin/rm"
+SUDO_BINARY="/usr/bin/sudo"
+TAIL_BINARY="/usr/bin/tail"
+UUENCODE_BINARY="/usr/bin/uuencode"
+WC_BINARY="/usr/bin/wc"
+
+# Definition des binaires propres à chaque distributions
+if [ -n "$(${GREP_BINARY} 'Debian' /etc/issue)" ] || [ -n "$(${GREP_BINARY} 'BackTrack 5' /etc/issue)" ] || [ -n "$(${GREP_BINARY} 'Ubuntu' /etc/issue)" ]; then
+        BASENAME_BINARY="/usr/bin/basename"
+        NC_BINARY="/bin/nc"
+        SORT_BINARY="/usr/bin/sort"
+        TOUCH_BINARY="/usr/bin/touch"
+else
+    if [ -n "$(${GREP_BINARY} 'Red Hat Enterprise Linux' /etc/issue)" ] || [ -n "$(${GREP_BINARY} 'CentOS' /etc/issue)" ] || [ -n "$(${GREP_BINARY} 'Fedora Core' /etc/issue)" ] || [ -n "${GREP_BINARY} 'vSphere Management Assistant' /etc/issue" ] ; then
+        BASENAME_BINARY="/bin/basename"
+        NC_BINARY="/usr/bin/nc"
+        SORT_BINARY="/bin/sort"
+        TOUCH_BINARY="/bin/touch"
+    else
+	${ECHO_BINARY} "OS non supporte"
+        exit 0
+    fi
+fi
+
+BINARY_LIST="${BASENAME_BINARY} ${BC_BINARY} ${CAT_BINARY} ${DATE_BINARY} ${DIRNAME_BINARY} ${ECHO_BINARY} ${FILE_BINARY} ${GREP_BINARY} ${HOSTNAME_BINARY} ${LOGGER_BINARY} ${LS_BINARY} ${MKDIR_BINARY} ${MKTEMP_BINARY} ${NC_BINARY} ${RM_BINARY} ${SORT_BINARY} ${SUDO_BINARY} ${TAIL_BINARY} ${UUENCODE_BINARY} ${WC_BINARY}"
+
+# Activer les cotes autour des expressions régulières
+# pour les version récentes de bash (>3.1)
+if [ -n "$(shopt | grep "compat31")" ] ; then
+    shopt -s compat31
+fi
+LC_ALL=POSIX
+export LC_ALL
+IFS_INI="${IFS}"
+
+# Generales
+DEBUG=${DEBUG:-0}                               # Niveau de debbuggage (0 à 9) (0 par defaut)
+LOG_FACILITY="${LOG_FACILITY:-local0}"          # Destination des logs (local0 à local7) (local0 par defaut)
+LOG_FILE="${LOG_FILE:-}"                        # Le fichier de log ou "syslog" (optionel) (stdout par defaut)
+PRINT_INDENT=""					# Indentation de depart pour la fonction d'affichage des messages de log
+PRINT_INDENT_STRING="${PRINT_INDENT_STRING:-}"	# Chaine utilisee pour l'indentation (desactive par defaut)
+MAIL_TMP_FOLDER="${MAIL_TMP_FOLDER:-/tmp/mail}" # Le repertoire temporaire pour la generation des messages
+NETCAT_TIMEOUT="5"                              # Time (in s) before netcat timeout
+
+isLaunchable "${BINARY_LIST}"
